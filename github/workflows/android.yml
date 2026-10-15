@@ -1,10 +1,16 @@
 # Compila o APK do Naruto Senki V2 (com o modo online) nos servidores do GitHub.
 # Como usar: aba "Actions" -> "Build Android APK" -> "Run workflow".
-# Se der erro, o passo "Resumo dos erros" mostra só as linhas importantes.
+#  - "Use workflow from": a ramificação onde estão ESTE arquivo e o online-mode-android.patch
+#  - source_branch: a ramificação com o código do jogo (normalmente master)
 name: Build Android APK
 
 on:
   workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Ramificação com o código do jogo (normalmente master)"
+        required: true
+        default: "master"
 
 jobs:
   build:
@@ -14,17 +20,42 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ndk: ["21.4.7075529", "22.1.7171670"]
+        ndk: ["21.4.7075529"]
     steps:
-      - uses: actions/checkout@v4
+      - name: Baixar o código do jogo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_branch }}
+
+      - name: Baixar o patch do modo online
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: _ci
+          sparse-checkout: |
+            online-mode-android.patch
+          sparse-checkout-cone-mode: false
 
       - name: Aplicar o modo online
         run: |
-          test -f online-mode-android.patch || { echo "ERRO: suba o arquivo online-mode-android.patch na raiz do repositorio"; exit 1; }
+          test -f _ci/online-mode-android.patch || { echo "ERRO: o arquivo online-mode-android.patch nao esta na raiz da ramificacao ${{ github.ref_name }}"; exit 1; }
+          cp _ci/online-mode-android.patch .
+          rm -rf _ci
           if [ -f projects/NarutoSenki/Classes/Online/OnlineBattle.cpp ]; then
             echo "Modo online ja esta no codigo, nada a aplicar."
-          else
-            patch -p1 --forward --no-backup-if-mismatch < online-mode-android.patch
+          elif ! patch -p1 --forward --no-backup-if-mismatch < online-mode-android.patch; then
+            echo ""
+            echo "=========== O PATCH NAO ENCAIXOU NESTA VERSAO DO JOGO ==========="
+            for rej in $(find . -name '*.rej'); do
+              src="${rej%.rej}"
+              echo ""
+              echo "--- Arquivo: $src ($(wc -l < "$src") linhas)"
+              echo "Trechos que falharam (cabecalhos):"
+              grep -n '^@@' "$rej" || true
+              echo "Primeiras linhas do arquivo:"
+              sed -n 1,18p "$src"
+            done
+            exit 1
           fi
 
       - name: Instalar SDK e NDK do Android
@@ -51,7 +82,7 @@ jobs:
         if: failure()
         run: |
           echo "=== Erros de compilacao (arquivo:linha) ==="
-          grep -E " error:| error: |undefined reference|Error [0-9]+$" "$RUNNER_TEMP/build.log" | grep -v "warning" | sort -u | head -40 || true
+          grep -E " error:|undefined reference|Error [0-9]+$" "$RUNNER_TEMP/build.log" | sort -u | head -40 || true
           echo "=== Resumo do Gradle ==="
           grep -A6 "What went wrong" "$RUNNER_TEMP/build.log" | head -20 || true
 
