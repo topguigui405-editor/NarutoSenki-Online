@@ -1,0 +1,2668 @@
+diff -ruN a/projects/NarutoSenki/Classes/CharacterBase.cpp b/projects/NarutoSenki/Classes/CharacterBase.cpp
+--- a/projects/NarutoSenki/Classes/CharacterBase.cpp	2026-10-15 03:41:21.281166501 +0000
++++ b/projects/NarutoSenki/Classes/CharacterBase.cpp	2026-10-15 03:41:21.282498760 +0000
+@@ -6,6 +6,7 @@
+ #include "MyUtils/CCShake.h"
+ #include "Systems/CommandSystem.hpp"
+ #include "Utils/Debug/UnitDebug.hpp"
++#include "Online/OnlineBattle.h"
+ 
+ CharacterBase::CharacterBase()
+ {
+@@ -4363,8 +4364,20 @@
+ 	}
+ }
+ 
++void CharacterBase::prepareRemoteAttack()
++{
++	// Mesmo critério da IA: herói mais próximo, senão soldado, senão torre
++	_mainTarget = nullptr;
++	if (!findHero(0))
++	{
++		if (!findFlog(0))
++			findTower(0);
++	}
++}
++
+ void CharacterBase::dead()
+ {
++	online::Battle::get().onCharacterDead(this);
+ 	getGameModeHandler()->onCharacterDead(this);
+ 	CCNotificationCenter::sharedNotificationCenter()->removeObserver(this, "acceptAttack");
+ 
+diff -ruN a/projects/NarutoSenki/Classes/CharacterBase.h b/projects/NarutoSenki/Classes/CharacterBase.h
+--- a/projects/NarutoSenki/Classes/CharacterBase.h	2026-10-15 03:41:21.287009434 +0000
++++ b/projects/NarutoSenki/Classes/CharacterBase.h	2026-10-15 03:41:21.288291860 +0000
+@@ -99,6 +99,7 @@
+ 	Vec2				_startPoint; // NOTE: Only for Minano
+ 
+ 	bool				_isAI;
++	bool				_isRemote = false; // Online: herói controlado por outro jogador (sem IA local)
+ 	bool				_isControlled;
+ 
+ 	PROP_Vector(vector<GearType>, _gearArray, GearArray);
+@@ -290,6 +291,7 @@
+ 	void				airHurt();
+ 
+ 	virtual void		doAI();
++	void				prepareRemoteAttack(); // Online: escolhe o alvo como a IA faria
+ 
+ 
+ 	virtual void		changeAction();
+diff -ruN a/projects/NarutoSenki/Classes/Core/Hero.hpp b/projects/NarutoSenki/Classes/Core/Hero.hpp
+--- a/projects/NarutoSenki/Classes/Core/Hero.hpp	2026-10-15 03:41:21.292750696 +0000
++++ b/projects/NarutoSenki/Classes/Core/Hero.hpp	2026-10-15 03:41:21.293934774 +0000
+@@ -553,6 +553,9 @@
+ 
+ 	void doAI()
+ 	{
++		// Online: heróis de outros jogadores são movidos pela rede, não pela IA
++		if (_isRemote)
++			return;
+ 		CharacterBase::doAI();
+ 		// Initial default AI handler
+ 		aiHandler = std::bind(&Hero::perform, this);
+diff -ruN a/projects/NarutoSenki/Classes/Data/UnitData.h b/projects/NarutoSenki/Classes/Data/UnitData.h
+--- a/projects/NarutoSenki/Classes/Data/UnitData.h	2026-10-15 03:41:21.298263965 +0000
++++ b/projects/NarutoSenki/Classes/Data/UnitData.h	2026-10-15 03:41:21.299612382 +0000
+@@ -19,6 +19,9 @@
+ 
+ 	bool isInit = false;
+ 
++	// Online: slot da sala (-1 = partida offline)
++	int onlineSlot = -1;
++
+ 	inline void setSpawnPoint(Vec2 &&sp)
+ 	{
+ 		spawnPoint.x = sp.x;
+diff -ruN a/projects/NarutoSenki/Classes/Defines.h b/projects/NarutoSenki/Classes/Defines.h
+--- a/projects/NarutoSenki/Classes/Defines.h	2026-10-15 03:41:21.303822235 +0000
++++ b/projects/NarutoSenki/Classes/Defines.h	2026-10-15 03:41:21.304965266 +0000
+@@ -8,6 +8,7 @@
+ #include "Enums/Audio.hpp"
+ #include "Enums/Character.h"
+ #include "Utils/Utils.h"
++#include "Online/OnlineFlag.h"
+ 
+ using namespace cocos2d;
+ using namespace CocosDenshion;
+@@ -15,7 +16,8 @@
+ 
+ #define winSize Director::sharedDirector()->getWinSize()
+ #define random(x) (rand() % x)
+-#define setRand() srand((uint32_t)time(0))
++// Online: durante uma partida online a semente vem do servidor (ver Online/OnlineBattle.cpp)
++#define setRand() do { if (!online::isMatchActive()) srand((uint32_t)time(0)); } while (0)
+ 
+ #define is_same(__Str1, __Str2) (strcmp(__Str1, __Str2) == 0)
+ #define to_cstr(var) (std::to_string(var).c_str())
+diff -ruN a/projects/NarutoSenki/Classes/GameLayer.cpp b/projects/NarutoSenki/Classes/GameLayer.cpp
+--- a/projects/NarutoSenki/Classes/GameLayer.cpp	2026-10-15 03:41:21.309139363 +0000
++++ b/projects/NarutoSenki/Classes/GameLayer.cpp	2026-10-15 03:41:21.310401503 +0000
+@@ -10,6 +10,7 @@
+ #include "Systems/BattleRuntimeSystem.hpp"
+ #include "Systems/SpawnSystem.hpp"
+ #include "Systems/SessionState.hpp"
++#include "Online/OnlineBattle.h"
+ 
+ GameLayer *_gLayer = nullptr;
+ bool _isFullScreen = false;
+@@ -176,6 +177,7 @@
+ 
+ 	if (_isSurrender)
+ 	{
++		online::Battle::get().localQuit(); // Online: a IA assume o seu herói para os outros
+ 		onGameOver(false);
+ 	}
+ }
+@@ -209,7 +211,8 @@
+ 		CCMessageBox("Not found any map", "[Error] Not found any map");
+ 		return;
+ 	}
+-	mapId = random(mapCount) + 1;
++	// Online: o mapa vem da semente da sala, para ser o mesmo em todos os celulares
++	mapId = online::Battle::get().active() ? (int)(online::Battle::get().info().seed % (uint32_t)mapCount) + 1 : random(mapCount) + 1;
+ 	currentMap = TMXTiledMap::create(GetMapPath(mapId));
+ 	addChild(currentMap, kMapOrder);
+ }
+@@ -337,7 +340,10 @@
+ 
+ Hero *GameLayer::addHero(const HeroData &data, int charId)
+ {
+-	return addHero(data.name, data.role, data.group, data.spawnPoint, charId);
++	auto hero = addHero(data.name, data.role, data.group, data.spawnPoint, charId);
++	if (data.onlineSlot >= 0)
++		online::Battle::get().registerHero(data.onlineSlot, hero);
++	return hero;
+ }
+ 
+ Hero *GameLayer::addHero(const string &name, Role role, Group group, Vec2 spawnPoint, int charId)
+@@ -386,6 +392,17 @@
+ 	_battleRuntimeSystem->onGameStart(this, handler->skipInitFlogs, handler->flogSpawnDuration);
+ 
+ 	getGameModeHandler()->onGameStart();
++
++	if (online::Battle::get().active())
++	{
++		online::Battle::get().onGameStarted();
++		schedule(schedule_selector(GameLayer::onlineTick), 0.05f);
++	}
++}
++
++void GameLayer::onlineTick(float dt)
++{
++	online::Battle::get().tick(dt);
+ }
+ 
+ void GameLayer::initFlogs()
+@@ -650,6 +667,10 @@
+ 
+ 	if (konohaTowerCount == 0 || akatsukiTowerCount == 0)
+ 	{
++		// Online: quem decide é o host; todos encerram quando chega o aviso
++		if (online::Battle::get().decideGameOver(konohaTowerCount, akatsukiTowerCount))
++			return;
++
+ 		if (playerGroup == Group::Konoha)
+ 			onGameOver(konohaTowerCount != 0);
+ 		else
+@@ -669,6 +690,7 @@
+ 
+ void GameLayer::JoyStickRelease()
+ {
++	online::Battle::get().localRelease();
+ 	if (currentPlayer->getState() == State::WALK)
+ 	{
+ 		currentPlayer->idle();
+@@ -680,12 +702,14 @@
+ 	if (!ougisChar)
+ 	{
+ 		// CCLOG("x:%f,y:%f",direction.x,direction.y);
++		online::Battle::get().localMove(direction.x, direction.y);
+ 		currentPlayer->walk(direction);
+ 	}
+ }
+ 
+ void GameLayer::attackButtonClick(ABType type)
+ {
++	online::Battle::get().localAttack((int)type);
+ 	if (type == NAttack)
+ 	{
+ 		_isAttackButtonRelease = false;
+@@ -703,11 +727,13 @@
+ 
+ void GameLayer::gearButtonClick(GearType type)
+ {
++	online::Battle::get().localGear((int)type);
+ 	currentPlayer->useGear(type);
+ }
+ 
+ void GameLayer::attackButtonRelease()
+ {
++	online::Battle::get().localAttackRelease();
+ 	_isAttackButtonRelease = true;
+ }
+ 
+@@ -716,6 +742,9 @@
+ 	if (_isPause)
+ 		return;
+ 
++	// Online: o menu de pausa só congela a SUA tela; avisa que o joystick foi solto
++	online::Battle::get().localRelease();
++
+ 	_isPause = true;
+ 	RenderTexture *snapshoot = RenderTexture::create(winSize.width, winSize.height);
+ 	Scene *f = Director::sharedDirector()->getRunningScene();
+@@ -758,6 +787,7 @@
+ 	if (_isGear)
+ 		return;
+ 	_isGear = true;
++	online::Battle::get().localRelease(); // a loja congela só a sua tela
+ 
+ 	RenderTexture *snapshoot = RenderTexture::create(winSize.width, winSize.height);
+ 	Scene *f = Director::sharedDirector()->getRunningScene();
+@@ -812,6 +842,8 @@
+ 
+ void GameLayer::onLeft()
+ {
++	online::Battle::get().shutdown();
++
+ 	CCNotificationCenter::sharedNotificationCenter()->purgeNotificationCenter();
+ 
+ 	CCArray *childArray = getChildren();
+diff -ruN a/projects/NarutoSenki/Classes/GameLayer.h b/projects/NarutoSenki/Classes/GameLayer.h
+--- a/projects/NarutoSenki/Classes/GameLayer.h	2026-10-15 03:41:21.313334715 +0000
++++ b/projects/NarutoSenki/Classes/GameLayer.h	2026-10-15 03:41:21.315872827 +0000
+@@ -127,6 +127,7 @@
+ 	void onGear();
+ 	void playGameOpeningAnimation(float dt);
+ 	void onGameStart(float dt);
++	void onlineTick(float dt); // Online: sincronização periódica da partida
+ 	void onGameOver(bool isWin);
+ 
+ 	void updateHudSkillButtons();
+diff -ruN a/projects/NarutoSenki/Classes/GameMode/IGameModeHandler.hpp b/projects/NarutoSenki/Classes/GameMode/IGameModeHandler.hpp
+--- a/projects/NarutoSenki/Classes/GameMode/IGameModeHandler.hpp	2026-10-15 03:41:21.320169277 +0000
++++ b/projects/NarutoSenki/Classes/GameMode/IGameModeHandler.hpp	2026-10-15 03:41:21.321304508 +0000
+@@ -124,6 +124,19 @@
+ 	}
+ 	inline const vector<HeroData> &getHerosArray() { return heroDataVector; }
+ 
++	// Online: elenco vindo do servidor, já na ordem do jogo (jogador local, aliados, inimigos)
++	void initOnlineHeros(const vector<HeroData> &ordered, Group localGroup)
++	{
++		clearHeroArray();
++		this->gd.playerGroup = localGroup;
++		this->playerGroup = localGroup;
++		for (auto &d : ordered)
++		{
++			heroDataVector.push_back(d);
++			heroVector.push_back(d.name);
++		}
++	}
++
+ protected:
+ 	// IGameModeHandler()
+ 	// {
+diff -ruN a/projects/NarutoSenki/Classes/GearLayer.cpp b/projects/NarutoSenki/Classes/GearLayer.cpp
+--- a/projects/NarutoSenki/Classes/GearLayer.cpp	2026-10-15 03:41:21.325478844 +0000
++++ b/projects/NarutoSenki/Classes/GearLayer.cpp	2026-10-15 03:41:21.326718316 +0000
+@@ -2,6 +2,7 @@
+ #include "GameLayer.h"
+ #include "HudLayer.h"
+ #include "Core/Hero.hpp"
++#include "Online/OnlineBattle.h"
+ 
+ /*----------------------
+ init GearButton ;
+@@ -331,6 +332,7 @@
+ 
+ 	if (getGameLayer()->currentPlayer->setGear(currentGear))
+ 	{
++		online::Battle::get().localBuyGear((int)currentGear);
+ 		updatePlayerGear();
+ 	}
+ }
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineBattle.cpp b/projects/NarutoSenki/Classes/Online/OnlineBattle.cpp
+--- a/projects/NarutoSenki/Classes/Online/OnlineBattle.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineBattle.cpp	2026-10-15 03:41:21.348932791 +0000
+@@ -0,0 +1,564 @@
++#include "Online/OnlineBattle.h"
++#include "GameMode/GameModeImpl.h"
++#include "Core/Tower/Tower.hpp"
++#include "GameLayer.h"
++#include "HudLayer.h"
++#include "LoadLayer.h"
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++extern int Cheats;
++
++namespace online
++{
++
++namespace
++{
++
++double nowSec()
++{
++	using namespace std::chrono;
++	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
++}
++
++Group groupOfTeam(int team) { return team == 0 ? Group::Konoha : Group::Akatsuki; }
++
++bool canAct(State s) { return s == State::IDLE || s == State::WALK || s == State::NATTACK; }
++
++float dist(const Vec2 &a, float x, float y)
++{
++	float dx = x - a.x, dy = y - a.y;
++	return std::sqrt(dx * dx + dy * dy);
++}
++
++} // namespace
++
++bool isMatchActive() { return Battle::get().active(); }
++
++Battle &Battle::get()
++{
++	static Battle instance;
++	return instance;
++}
++
++const SlotInfo *Battle::slotInfo(int slot) const
++{
++	for (auto &s : _info.slots)
++		if (s.slot == slot)
++			return &s;
++	return nullptr;
++}
++
++// Só devolve o herói se ele ainda estiver na partida (ponteiros antigos são descartados)
++Hero *Battle::heroOf(int slot)
++{
++	if (slot < 0 || slot >= (int)_heroBySlot.size())
++		return nullptr;
++	auto layer = getGameLayer();
++	Hero *h = _heroBySlot[slot];
++	if (!layer || !h)
++		return nullptr;
++	auto &all = layer->_CharacterArray;
++	return std::find(all.begin(), all.end(), h) != all.end() ? h : nullptr;
++}
++
++// ------------------------------------------------------------------------------------------------
++// Início
++// ------------------------------------------------------------------------------------------------
++void Battle::launch(const StartInfo &info)
++{
++	auto &client = Client::get();
++	_info = info;
++	_mySlot = client.mySlot();
++	_myTeam = 0;
++	for (auto &s : info.slots)
++		if (s.slot == _mySlot)
++			_myTeam = s.team;
++
++	size_t n = info.slots.size();
++	_heroBySlot.assign(n, nullptr);
++	_remote.assign(n, RemoteInput());
++	_started = false;
++	_fallback = false;
++	_overSent = false;
++	_gameOverShown = false;
++	_tickCount = 0;
++	_moving = false;
++	_lastX = _lastY = 0;
++	_towerMissing.clear();
++
++	// O modo de jogo (mapa/torres/soldados) segue o tamanho da sala
++	GameMode mode = info.size == 1 ? GameMode::OneVsOne : (info.size == 4 ? GameMode::FourVsFour : GameMode::Classic);
++	s_GameMode = mode;
++	auto handler = getGameModeHandler();
++	handler->setOldCheats(Cheats);
++	handler->init();
++
++	// Ordem esperada pelo GameLayer::initHeros: jogador local, aliados, inimigos
++	vector<HeroData> roster;
++	auto add = [&](const SlotInfo &s)
++	{
++		HeroData d;
++		d.name = s.hero;
++		d.role = (s.slot == _mySlot) ? Role::Player : Role::Com;
++		d.group = groupOfTeam(s.team);
++		d.onlineSlot = s.slot;
++		roster.push_back(d);
++	};
++	for (auto &s : info.slots)
++		if (s.slot == _mySlot)
++			add(s);
++	for (auto &s : info.slots)
++		if (s.team == _myTeam && s.slot != _mySlot)
++			add(s);
++	for (auto &s : info.slots)
++		if (s.team != _myTeam)
++			add(s);
++	handler->initOnlineHeros(roster, groupOfTeam(_myTeam));
++
++	_active = true;
++	srand(info.seed); // todos os celulares partem da mesma semente
++	bindClient();
++
++	// mesma transição que SelectLayer::onGameStart faz
++	SimpleAudioEngine::sharedEngine()->stopBackgroundMusic(true);
++	SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/confirm.ogg");
++	Scene *loadScene = Scene::create();
++	LoadLayer *loadLayer = LoadLayer::create();
++	loadLayer->preloadAudio();
++	loadScene->addChild(loadLayer);
++	Director::sharedDirector()->replaceScene(TransitionFade::create(1.25f, loadScene));
++}
++
++void Battle::bindClient()
++{
++	auto &c = Client::get();
++	c.clearHandlers();
++	c.onInput = [this](int slot, char kind, int a, int b) { onRemoteInput(slot, kind, a, b); };
++	c.onSnapshot = [this](const std::string &p) { onSnapshot(p); };
++	c.onEvent = [this](const std::string &p) { onEvent(p); };
++	c.onPlayerLeft = [this](int slot, const std::string &) { onPlayerLeft(slot); };
++	c.onOver = [this](int team) { onOver(team); };
++	c.onDisconnected = [this](const std::string &) { onConnectionLost(); };
++}
++
++void Battle::registerHero(int slot, Hero *hero)
++{
++	if (!_active || !hero || slot < 0)
++		return;
++	if (slot >= (int)_heroBySlot.size())
++	{
++		_heroBySlot.resize(slot + 1, nullptr);
++		_remote.resize(slot + 1);
++	}
++	_heroBySlot[slot] = hero;
++	auto si = slotInfo(slot);
++	if (si && si->human && slot != _mySlot)
++		hero->_isRemote = true; // sem IA: quem manda é o outro jogador
++}
++
++void Battle::onGameStarted()
++{
++	if (!_active)
++		return;
++	_started = true;
++	_tickCount = 0;
++	if (_fallback) // a conexão caiu durante o carregamento
++		for (size_t i = 0; i < _heroBySlot.size(); i++)
++			handOverToAI((int)i);
++}
++
++// ------------------------------------------------------------------------------------------------
++// A cada 50 ms
++// ------------------------------------------------------------------------------------------------
++void Battle::tick(float)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	_tickCount++;
++
++	// 1) herói remoto: repete o "joystick segurado" e o "ataque segurado"
++	for (size_t slot = 0; slot < _heroBySlot.size() && slot < _remote.size(); slot++)
++	{
++		Hero *h = heroOf((int)slot);
++		if (!h || !h->_isRemote)
++			continue;
++		State st = h->getState();
++		if (st != State::IDLE && st != State::WALK)
++			continue;
++		auto &in = _remote[slot];
++		if (in.hold)
++		{
++			h->prepareRemoteAttack();
++			h->attack(NAttack);
++		}
++		else if (in.dx != 0 || in.dy != 0)
++		{
++			h->walk(Vec2(in.dx, in.dy));
++		}
++	}
++
++	// 2) host: estado autoritativo ~7x por segundo
++	if (Client::get().isHost() && _tickCount % 3 == 0)
++		sendSnapshot();
++}
++
++void Battle::sendSnapshot()
++{
++	auto layer = getGameLayer();
++	if (!layer)
++		return;
++	std::string s = "S";
++	char buf[96];
++	for (size_t slot = 0; slot < _heroBySlot.size(); slot++)
++	{
++		Hero *h = heroOf((int)slot);
++		if (!h)
++			continue;
++		bool dead = h->getState() == State::DEAD;
++		snprintf(buf, sizeof(buf), " h%d:%d:%d:%u:%d:%d", (int)slot,
++				 (int)std::lround(h->getPositionX()), (int)std::lround(h->getPositionY()),
++				 (unsigned)h->getHP(), h->_isFlipped ? 1 : 0, dead ? 1 : 0);
++		s += buf;
++	}
++	for (auto t : layer->_TowerArray)
++	{
++		snprintf(buf, sizeof(buf), " t%d:%u", t->getCharId(), (unsigned)t->getHP());
++		s += buf;
++	}
++	Client::get().sendSnapshot(s);
++}
++
++// ------------------------------------------------------------------------------------------------
++// Recebimento
++// ------------------------------------------------------------------------------------------------
++void Battle::onRemoteInput(int slot, char kind, int a, int b)
++{
++	if (!_active || !_started || _fallback || slot == _mySlot)
++		return;
++	Hero *h = heroOf(slot);
++	if (!h || !h->_isRemote || slot >= (int)_remote.size())
++		return;
++	auto &in = _remote[slot];
++	State st = h->getState();
++	if (st == State::DEAD)
++	{
++		in = RemoteInput();
++		return;
++	}
++
++	switch (kind)
++	{
++	case 'M':
++		in.dx = a / 100.0f;
++		in.dy = b / 100.0f;
++		if (canAct(st))
++			h->walk(Vec2(in.dx, in.dy));
++		break;
++	case 'R':
++		in.dx = in.dy = 0;
++		if (st == State::WALK)
++			h->idle();
++		break;
++	case 'B':
++		in.hold = false;
++		break;
++	case 'A':
++	{
++		ABType type = static_cast<ABType>(a);
++		if (type == Item1)
++		{
++			h->_isCanItem1 = true; // quem enviou já respeitou a própria recarga
++			h->setItem(type);
++			break;
++		}
++		if (!canAct(st))
++			break;
++		if (type == NAttack)
++			in.hold = true;
++		// habilidades: o remetente já respeitou recarga/chakra no próprio celular
++		if (type == SKILL1)
++			h->_isCanSkill1 = true;
++		else if (type == SKILL2)
++			h->_isCanSkill2 = true;
++		else if (type == SKILL3)
++			h->_isCanSkill3 = true;
++		else if (type == OUGIS1)
++			h->_isCanOugis1 = true;
++		else if (type == OUGIS2)
++			h->_isCanOugis2 = true;
++		if (type == NAttack || type == SKILL1 || type == SKILL2 || type == SKILL3 || type == OUGIS1 || type == OUGIS2)
++		{
++			h->prepareRemoteAttack();
++			h->attack(type);
++		}
++		break;
++	}
++	case 'G':
++		h->useGear(static_cast<GearType>(a));
++		break;
++	case 'S':
++		h->setGear(static_cast<GearType>(a));
++		break;
++	default:
++		break;
++	}
++}
++
++void Battle::onSnapshot(const std::string &payload)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	auto layer = getGameLayer();
++	if (!layer)
++		return;
++
++	std::map<int, bool> seenTowers;
++	for (auto &tok : Client::split(payload))
++	{
++		if (tok.size() < 2)
++			continue;
++		auto p = Client::split(tok.substr(1), ':');
++		if (tok[0] == 'h' && p.size() >= 6)
++		{
++			int slot = std::atoi(p[0].c_str());
++			float x = (float)std::atoi(p[1].c_str());
++			float y = (float)std::atoi(p[2].c_str());
++			uint32_t hp = (uint32_t)std::strtoul(p[3].c_str(), nullptr, 10);
++			bool deadOnHost = p[5] == "1";
++			Hero *h = heroOf(slot);
++			if (!h || deadOnHost || h->getState() == State::DEAD)
++				continue; // a morte chega por evento; renascimento acontece localmente
++
++			if (hp > 0 && h->getHP() != hp)
++			{
++				h->setHPValue(hp);
++				if (h->isPlayer())
++					layer->setHPLose(h->getHpPercent());
++			}
++
++			// O herói do próprio jogador só é corrigido se estiver muito longe (evita "puxões");
++			// os demais seguem o host de perto.
++			bool mine = slot == _mySlot;
++			float snapDist = mine ? 260.0f : 160.0f;
++			float lerpMin = mine ? 120.0f : 10.0f;
++			float k = mine ? 0.15f : 0.45f;
++			Vec2 cur = h->getPosition();
++			float d = dist(cur, x, y);
++			if (d >= snapDist)
++				h->setPosition(Vec2(x, y));
++			else if (d > lerpMin)
++				h->setPosition(Vec2(cur.x + (x - cur.x) * k, cur.y + (y - cur.y) * k));
++			else
++				continue;
++			layer->reorderChild(h, -h->getPositionY());
++		}
++		else if (tok[0] == 't' && p.size() >= 2)
++		{
++			int id = std::atoi(p[0].c_str());
++			uint32_t hp = (uint32_t)std::strtoul(p[1].c_str(), nullptr, 10);
++			seenTowers[id] = true;
++			for (auto t : layer->_TowerArray)
++				if (t->getCharId() == id && hp > 0 && hp < t->getHP())
++					t->setHPValue(hp);
++		}
++	}
++
++	// torre que sumiu do snapshot do host foi destruída lá: destrói aqui também
++	if (!seenTowers.empty())
++	{
++		auto towers = layer->_TowerArray; // cópia: dead() mexe na lista
++		for (auto t : towers)
++		{
++			int id = t->getCharId();
++			if (seenTowers.count(id))
++			{
++				_towerMissing[id] = 0;
++				continue;
++			}
++			if (++_towerMissing[id] >= 2 && t->getState() != State::DEAD)
++			{
++				t->setHPValue(0);
++				t->dead();
++			}
++		}
++	}
++}
++
++void Battle::onEvent(const std::string &payload)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	auto f = Client::split(payload);
++	if (f.size() >= 2 && f[0] == "D")
++	{
++		Hero *h = heroOf(std::atoi(f[1].c_str()));
++		if (h && h->getState() != State::DEAD)
++		{
++			h->setHPValue(0);
++			h->dead();
++		}
++	}
++}
++
++void Battle::onPlayerLeft(int slot)
++{
++	if (!_active || slot == _mySlot)
++		return;
++	for (auto &s : _info.slots)
++		if (s.slot == slot)
++			s.human = false;
++	if (_started)
++		handOverToAI(slot);
++}
++
++void Battle::handOverToAI(int slot)
++{
++	Hero *h = heroOf(slot);
++	if (!h || !h->_isRemote)
++		return;
++	h->_isRemote = false;
++	if (slot < (int)_remote.size())
++		_remote[slot] = RemoteInput();
++	if (h->getState() == State::DEAD)
++		return; // ao renascer o jogo religa a IA sozinho (Hero::reborn)
++	if (h->getState() == State::WALK)
++		h->idle();
++	h->doAI();
++}
++
++void Battle::onConnectionLost()
++{
++	if (!_active || _fallback)
++		return;
++	_fallback = true; // sem rede: os outros jogadores viram IA e a partida segue offline
++	if (_started)
++	{
++		for (size_t i = 0; i < _heroBySlot.size(); i++)
++			handOverToAI((int)i);
++		if (auto layer = getGameLayer())
++			layer->checkTower(); // reavalia o fim de jogo agora que ele é local
++	}
++}
++
++void Battle::onOver(int winnerTeam)
++{
++	if (!_active || !_started || _gameOverShown)
++		return;
++	auto layer = getGameLayer();
++	if (!layer)
++		return;
++	_gameOverShown = true;
++	layer->onGameOver(winnerTeam == _myTeam);
++}
++
++bool Battle::decideGameOver(int konohaTowers, int akatsukiTowers)
++{
++	if (!_active || _fallback)
++		return false; // offline: decide como sempre
++	if (Client::get().isHost() && !_overSent)
++	{
++		_overSent = true;
++		Client::get().sendOver(akatsukiTowers == 0 ? 0 : 1); // time 0 = Konoha
++	}
++	(void)konohaTowers;
++	return true; // todos (inclusive o host) encerram ao receber OVER
++}
++
++void Battle::onCharacterDead(CharacterBase *c)
++{
++	if (!_active || !_started || _fallback || !Client::get().isHost())
++		return;
++	for (size_t slot = 0; slot < _heroBySlot.size(); slot++)
++	{
++		if (_heroBySlot[slot] == c)
++		{
++			Client::get().sendEvent("D " + std::to_string(slot));
++			return;
++		}
++	}
++}
++
++void Battle::shutdown()
++{
++	if (!_active)
++		return;
++	auto &c = Client::get();
++	c.clearHandlers();
++	c.disconnect(); // o servidor passa o herói para a IA e avisa os outros
++	_active = false;
++	_started = false;
++	_fallback = false;
++	_heroBySlot.clear();
++	_remote.clear();
++}
++
++// ------------------------------------------------------------------------------------------------
++// Entradas locais
++// ------------------------------------------------------------------------------------------------
++void Battle::localMove(float x, float y)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	int ix = (int)std::lround(x * 100), iy = (int)std::lround(y * 100);
++	double now = nowSec();
++	bool changed = std::abs(ix - _lastX) + std::abs(iy - _lastY) >= 12;
++	if ((changed || !_moving) && now - _lastMoveT >= 0.05)
++	{
++		Client::get().sendInput('M', ix, iy);
++		_lastX = ix;
++		_lastY = iy;
++		_lastMoveT = now;
++		_moving = true;
++	}
++}
++
++void Battle::localRelease()
++{
++	if (!_active || !_started || _fallback || !_moving)
++		return;
++	Client::get().sendInput('R');
++	_moving = false;
++	_lastX = _lastY = 0;
++}
++
++void Battle::localAttack(int abType)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	Client::get().sendInput('A', abType);
++}
++
++void Battle::localAttackRelease()
++{
++	if (!_active || !_started || _fallback)
++		return;
++	Client::get().sendInput('B');
++}
++
++void Battle::localGear(int gearType)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	Client::get().sendInput('G', gearType);
++}
++
++void Battle::localBuyGear(int gearType)
++{
++	if (!_active || !_started || _fallback)
++		return;
++	Client::get().sendInput('S', gearType);
++}
++
++void Battle::localQuit()
++{
++	if (!_active || _fallback)
++		return;
++	_fallback = true; // a partir daqui joga sozinho; os outros passam a ver a IA no meu herói
++	Client::get().quitBattle();
++}
++
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineBattle.h b/projects/NarutoSenki/Classes/Online/OnlineBattle.h
+--- a/projects/NarutoSenki/Classes/Online/OnlineBattle.h	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineBattle.h	2026-10-15 03:41:21.347837968 +0000
+@@ -0,0 +1,92 @@
++#pragma once
++// Sincronização da partida online.
++//
++// Modelo: cada celular roda o jogo inteiro (código original). O que muda:
++//  - o herói de cada jogador humano é movido pelos comandos que ele envia (mover, atacar, usar/comprar gear);
++//  - o HOST da sala manda, ~7x por segundo, a posição/vida de todos os heróis e a vida das torres,
++//    e os demais celulares se corrigem em cima disso (sem "puxões" no herói do próprio jogador);
++//  - fim de jogo é decidido só pelo host e avisado a todos;
++//  - quem sai (ou perde a conexão) tem o herói assumido pela IA.
++#include "Defines.h"
++#include "Online/OnlineClient.h"
++#include <map>
++#include <string>
++#include <vector>
++
++class Hero;
++class CharacterBase;
++
++namespace online
++{
++
++class Battle
++{
++public:
++	static Battle &get();
++
++	bool active() const { return _active; }
++	const StartInfo &info() const { return _info; }
++	int mySlot() const { return _mySlot; }
++
++	/** Lobby -> jogo: monta o elenco no modo de jogo certo e abre a tela de carregamento. */
++	void launch(const StartInfo &info);
++
++	// ---- ganchos do GameLayer / CharacterBase ----
++	void registerHero(int slot, Hero *hero);
++	void onGameStarted();
++	void tick(float dt); // a cada 50 ms enquanto a partida não está pausada
++	/** Chamado por GameLayer::checkTower. true = o online cuida do resultado (não decidir localmente). */
++	bool decideGameOver(int konohaTowers, int akatsukiTowers);
++	void onCharacterDead(CharacterBase *c);
++	void shutdown(); // ao sair da partida (GameLayer::onLeft)
++
++	// ---- entradas do jogador local (enviadas aos demais) ----
++	void localMove(float x, float y);
++	void localRelease();
++	void localAttack(int abType);
++	void localAttackRelease();
++	void localGear(int gearType);
++	void localBuyGear(int gearType);
++	void localQuit(); // rendição / sair no meio da partida
++
++private:
++	struct RemoteInput
++	{
++		float dx = 0, dy = 0;
++		bool hold = false; // botão de ataque normal segurado
++	};
++
++	void bindClient();
++	void onRemoteInput(int slot, char kind, int a, int b);
++	void onSnapshot(const std::string &payload);
++	void onEvent(const std::string &payload);
++	void onPlayerLeft(int slot);
++	void onConnectionLost();
++	void onOver(int winnerTeam);
++	void sendSnapshot();
++	void handOverToAI(int slot);
++	Hero *heroOf(int slot);
++	const SlotInfo *slotInfo(int slot) const;
++
++	bool _active = false;
++	bool _started = false;	// GameLayer já iniciou (antes disso mensagens da partida são ignoradas)
++	bool _fallback = false; // conexão caiu / saiu da partida: segue sozinho contra a IA
++	bool _overSent = false;
++	bool _gameOverShown = false;
++	StartInfo _info;
++	int _mySlot = -1;
++	int _myTeam = 0;
++	int _tickCount = 0;
++	std::vector<Hero *> _heroBySlot;
++	std::vector<RemoteInput> _remote;
++
++	// throttle do joystick local
++	int _lastX = 0, _lastY = 0;
++	bool _moving = false;
++	double _lastMoveT = 0;
++
++	// torres ausentes do último snapshot (para detectar torre destruída no host)
++	std::map<int, int> _towerMissing;
++};
++
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineClient.cpp b/projects/NarutoSenki/Classes/Online/OnlineClient.cpp
+--- a/projects/NarutoSenki/Classes/Online/OnlineClient.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineClient.cpp	2026-10-15 03:41:21.346710947 +0000
+@@ -0,0 +1,640 @@
++#include "OnlineClient.h"
++
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#pragma comment(lib, "ws2_32.lib")
++typedef SOCKET sock_t;
++typedef int socklen_t_;
++static const sock_t kInvalidSock = INVALID_SOCKET;
++#else
++#include <arpa/inet.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++typedef int sock_t;
++typedef socklen_t socklen_t_;
++static const sock_t kInvalidSock = -1;
++#endif
++
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0
++#endif
++
++namespace online
++{
++
++namespace
++{
++
++long long nowMs()
++{
++	using namespace std::chrono;
++	return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
++}
++
++#ifdef _WIN32
++struct WsaInit
++{
++	WsaInit()
++	{
++		WSADATA d;
++		WSAStartup(MAKEWORD(2, 2), &d);
++	}
++} s_wsaInit;
++void closeSock(sock_t s) { closesocket(s); }
++void setNonBlocking(sock_t s)
++{
++	u_long m = 1;
++	ioctlsocket(s, FIONBIO, &m);
++}
++bool wouldBlock() { return WSAGetLastError() == WSAEWOULDBLOCK; }
++bool inProgress() { return WSAGetLastError() == WSAEWOULDBLOCK; }
++bool interrupted() { return false; }
++#else
++void closeSock(sock_t s) { ::close(s); }
++void setNonBlocking(sock_t s) { fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK); }
++bool wouldBlock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
++bool inProgress() { return errno == EINPROGRESS; }
++bool interrupted() { return errno == EINTR; }
++#endif
++
++// espera o socket ficar legível (read=true) ou gravável (read=false). >0 pronto, 0 timeout, <0 erro
++int waitSock(sock_t s, bool read, int ms)
++{
++#ifndef _WIN32
++	if (s >= FD_SETSIZE)
++		return -1;
++#endif
++	fd_set fs, es;
++	FD_ZERO(&fs);
++	FD_ZERO(&es);
++	FD_SET(s, &fs);
++	FD_SET(s, &es);
++	timeval tv;
++	tv.tv_sec = ms / 1000;
++	tv.tv_usec = (ms % 1000) * 1000;
++	int r = select((int)s + 1, read ? &fs : nullptr, read ? nullptr : &fs, &es, &tv);
++	if (r > 0 && FD_ISSET(s, &es))
++		return -1;
++	return r;
++}
++
++std::string sanitizeNick(const std::string &in)
++{
++	std::string out;
++	for (char c : in)
++	{
++		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
++			out += c;
++		if (out.size() >= 12)
++			break;
++	}
++	return out.empty() ? "Ninja" : out;
++}
++
++int toInt(const std::string &s, int def = 0)
++{
++	if (s.empty())
++		return def;
++	char *end = nullptr;
++	long v = strtol(s.c_str(), &end, 10);
++	return (end && *end == '\0') ? (int)v : def;
++}
++
++// Chama uma CÓPIA do callback: ele pode trocar de tela e limpar/substituir os handlers enquanto roda.
++template <class F, class... A>
++void fire(const F &f, A &&...a)
++{
++	if (f)
++	{
++		F copy = f;
++		copy(std::forward<A>(a)...);
++	}
++}
++
++} // namespace
++
++// ------------------------------------------------------------------------------------------------
++// Conexão: uma thread cuida de DNS, connect, leitura e escrita. A thread principal só mexe nas filas.
++// ------------------------------------------------------------------------------------------------
++struct Client::Conn
++{
++	std::mutex mx;
++	std::deque<std::string> in; // linhas para a thread principal ("!CONNECTED", "!CLOSED motivo", ...)
++	std::string out;			// bytes pendentes de envio
++	std::atomic<bool> stop{false};
++	std::string host;
++	int port = kDefaultPort;
++
++	void pushIn(const std::string &s)
++	{
++		std::lock_guard<std::mutex> lk(mx);
++		in.push_back(s);
++	}
++};
++
++namespace
++{
++
++bool sendAll(sock_t fd, const std::string &data, const std::atomic<bool> &stop)
++{
++	size_t off = 0;
++	long long deadline = nowMs() + 5000;
++	while (off < data.size())
++	{
++		if (stop)
++			return false;
++		int n = (int)::send(fd, data.data() + off, (int)(data.size() - off), MSG_NOSIGNAL);
++		if (n > 0)
++		{
++			off += (size_t)n;
++			continue;
++		}
++		if (n < 0 && interrupted())
++			continue;
++		if (n < 0 && wouldBlock())
++		{
++			if (nowMs() > deadline)
++				return false;
++			waitSock(fd, false, 100);
++			continue;
++		}
++		return false;
++	}
++	return true;
++}
++
++void ioMain(std::shared_ptr<Client::Conn> c)
++{
++	// 1) DNS + connect (com limite de 8 s)
++	addrinfo hints;
++	memset(&hints, 0, sizeof(hints));
++	hints.ai_family = AF_UNSPEC;
++	hints.ai_socktype = SOCK_STREAM;
++	addrinfo *res = nullptr;
++	std::string portStr = std::to_string(c->port);
++	if (getaddrinfo(c->host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res)
++	{
++		if (!c->stop)
++			c->pushIn("!FAIL dns");
++		return;
++	}
++
++	sock_t fd = kInvalidSock;
++	long long deadline = nowMs() + 8000;
++	for (addrinfo *ai = res; ai && fd == kInvalidSock && !c->stop; ai = ai->ai_next)
++	{
++		sock_t s = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
++		if (s == kInvalidSock)
++			continue;
++		setNonBlocking(s);
++		bool ok = false;
++		int r = ::connect(s, ai->ai_addr, (int)ai->ai_addrlen);
++		if (r == 0)
++		{
++			ok = true;
++		}
++		else if (inProgress() || interrupted())
++		{
++			while (!c->stop && nowMs() < deadline)
++			{
++				int pr = waitSock(s, false, 100);
++				if (pr > 0)
++				{
++					int err = 0;
++					socklen_t_ len = sizeof(err);
++					getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
++					ok = (err == 0);
++					break;
++				}
++				if (pr < 0)
++					break;
++			}
++		}
++		if (ok)
++			fd = s;
++		else
++			closeSock(s);
++	}
++	freeaddrinfo(res);
++
++	if (fd == kInvalidSock)
++	{
++		if (!c->stop)
++			c->pushIn(nowMs() >= deadline ? "!FAIL timeout" : "!FAIL refused");
++		return;
++	}
++
++	int one = 1;
++	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
++#ifdef SO_NOSIGPIPE
++	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof(one));
++#endif
++	c->pushIn("!CONNECTED");
++
++	// 2) laço de leitura/escrita
++	std::string rbuf;
++	char tmp[4096];
++	long long nextPing = nowMs() + 10000;
++	std::string closeReason = "closed";
++	while (!c->stop)
++	{
++		int pr = waitSock(fd, true, 15);
++		if (pr < 0)
++		{
++			closeReason = "error";
++			break;
++		}
++		if (pr > 0)
++		{
++			int n = (int)::recv(fd, tmp, sizeof(tmp), 0);
++			if (n > 0)
++			{
++				rbuf.append(tmp, (size_t)n);
++				size_t pos;
++				while ((pos = rbuf.find('\n')) != std::string::npos)
++				{
++					std::string line = rbuf.substr(0, pos);
++					rbuf.erase(0, pos + 1);
++					if (!line.empty() && line.back() == '\r')
++						line.pop_back();
++					if (!line.empty())
++						c->pushIn(line);
++				}
++				if (rbuf.size() > 8192)
++				{
++					closeReason = "overflow";
++					break;
++				}
++			}
++			else if (n == 0)
++			{
++				closeReason = "server_closed";
++				break;
++			}
++			else if (!wouldBlock() && !interrupted())
++			{
++				closeReason = "error";
++				break;
++			}
++		}
++
++		long long now = nowMs();
++		if (now >= nextPing)
++		{
++			nextPing = now + 10000;
++			std::lock_guard<std::mutex> lk(c->mx);
++			c->out += "PING " + std::to_string(now & 0x7fffffff) + "\n";
++		}
++
++		std::string data;
++		{
++			std::lock_guard<std::mutex> lk(c->mx);
++			data.swap(c->out);
++		}
++		if (!data.empty() && !sendAll(fd, data, c->stop))
++		{
++			closeReason = "send_failed";
++			break;
++		}
++	}
++
++	closeSock(fd);
++	if (!c->stop)
++		c->pushIn("!CLOSED " + closeReason);
++}
++
++} // namespace
++
++// ------------------------------------------------------------------------------------------------
++
++Client::Client() {}
++
++Client::~Client()
++{
++	if (_conn)
++		_conn->stop = true; // a thread (desanexada) encerra sozinha
++}
++
++Client &Client::get()
++{
++	static Client instance;
++	return instance;
++}
++
++std::vector<std::string> Client::split(const std::string &s, char sep)
++{
++	std::vector<std::string> out;
++	size_t start = 0;
++	while (true)
++	{
++		size_t p = s.find(sep, start);
++		if (p == std::string::npos)
++		{
++			out.push_back(s.substr(start));
++			break;
++		}
++		out.push_back(s.substr(start, p - start));
++		start = p + 1;
++	}
++	return out;
++}
++
++void Client::clearHandlers()
++{
++	onConnected = nullptr;
++	onDisconnected = nullptr;
++	onError = nullptr;
++	onRooms = nullptr;
++	onJoinedRoom = nullptr;
++	onRoom = nullptr;
++	onLeftRoom = nullptr;
++	onStart = nullptr;
++	onInput = nullptr;
++	onSnapshot = nullptr;
++	onEvent = nullptr;
++	onPlayerLeft = nullptr;
++	onHostChanged = nullptr;
++	onOver = nullptr;
++}
++
++void Client::connect(const std::string &host, int port, const std::string &nick)
++{
++	teardown("", false);
++	_nick = sanitizeNick(nick);
++	_conn = std::make_shared<Conn>();
++	_conn->host = host;
++	_conn->port = port > 0 ? port : kDefaultPort;
++	_state = State::Connecting;
++	_mySlot = _hostSlot = -1;
++	_room = RoomState();
++	auto conn = _conn;
++	std::thread([conn]() { ioMain(conn); }).detach();
++}
++
++void Client::disconnect()
++{
++	teardown("", false);
++}
++
++void Client::teardown(const std::string &reason, bool notify)
++{
++	if (_conn)
++	{
++		_conn->stop = true;
++		_conn.reset();
++	}
++	bool wasOnline = _state != State::Offline;
++	_state = State::Offline;
++	_mySlot = _hostSlot = -1;
++	_room = RoomState();
++	if (notify && wasOnline)
++		fire(onDisconnected, reason);
++}
++
++void Client::send(const std::string &line)
++{
++	if (!_conn)
++		return;
++	std::lock_guard<std::mutex> lk(_conn->mx);
++	_conn->out += line;
++	_conn->out += '\n';
++}
++
++void Client::pump()
++{
++	auto conn = _conn;
++	if (!conn)
++		return;
++	std::deque<std::string> batch;
++	{
++		std::lock_guard<std::mutex> lk(conn->mx);
++		batch.swap(conn->in);
++	}
++	for (auto &line : batch)
++	{
++		if (_conn != conn)
++			break; // um callback trocou/encerrou a conexão
++		dispatch(line);
++	}
++}
++
++// ---- comandos ----
++void Client::listRooms() { send("LIST"); }
++void Client::createRoom(int size) { send("CREATE " + std::to_string(size)); }
++void Client::joinRoom(const std::string &id) { send("JOIN " + id); }
++void Client::leaveRoom() { send("LEAVE"); }
++void Client::setTeam(int team) { send("TEAM " + std::to_string(team)); }
++void Client::setHero(const std::string &hero) { send("HERO " + hero); }
++void Client::setReady(bool ready) { send(ready ? "READY 1" : "READY 0"); }
++void Client::startMatch() { send("START"); }
++void Client::sendInput(char kind, int a, int b)
++{
++	if (_state != State::InBattle)
++		return;
++	send(std::string("IN ") + kind + " " + std::to_string(a) + " " + std::to_string(b));
++}
++void Client::sendSnapshot(const std::string &payload)
++{
++	if (_state == State::InBattle && isHost())
++		send("SNAP " + payload);
++}
++void Client::sendEvent(const std::string &payload)
++{
++	if (_state == State::InBattle && isHost())
++		send("EVT " + payload);
++}
++void Client::sendOver(int winnerTeam)
++{
++	if (_state == State::InBattle && isHost())
++		send("OVER " + std::to_string(winnerTeam));
++}
++void Client::quitBattle()
++{
++	if (_state == State::InBattle)
++	{
++		send("BACK");
++		_state = State::Online;
++		_mySlot = _hostSlot = -1;
++	}
++}
++
++// ---- mensagens do servidor ----
++void Client::dispatch(const std::string &line)
++{
++	if (line.empty())
++		return;
++	if (line[0] == '!')
++	{
++		if (line == "!CONNECTED")
++		{
++			send("HELLO " + std::to_string(kProtocolVersion) + " " + _nick);
++		}
++		else
++		{
++			auto f = split(line);
++			teardown(f.size() > 1 ? f[1] : "closed", true);
++		}
++		return;
++	}
++
++	auto f = split(line);
++	const std::string &cmd = f[0];
++
++	if (cmd == "WELCOME")
++	{
++		_state = State::Online;
++		fire(onConnected);
++	}
++	else if (cmd == "ERR")
++	{
++		std::string code = f.size() > 1 ? f[1] : "UNKNOWN";
++		if (code == "PROTO")
++		{
++			teardown("PROTO", true);
++			return;
++		}
++		fire(onError, code);
++	}
++	else if (cmd == "PONG")
++	{
++		int t = toInt(f.size() > 1 ? f[1] : "0");
++		int now = (int)(nowMs() & 0x7fffffff);
++		int rtt = now - t;
++		if (rtt >= 0 && rtt < 60000)
++			_pingMs = rtt;
++	}
++	else if (cmd == "ROOMS")
++	{
++		std::vector<RoomBrief> rooms;
++		for (size_t i = 2; i < f.size(); i++)
++		{
++			auto p = split(f[i], ':');
++			if (p.size() < 4)
++				continue;
++			RoomBrief b;
++			b.id = p[0];
++			b.size = toInt(p[1]);
++			b.humans = toInt(p[2]);
++			b.host = p[3];
++			rooms.push_back(b);
++		}
++		fire(onRooms, rooms);
++	}
++	else if (cmd == "JOINED" && f.size() >= 4)
++	{
++		_state = State::InRoom;
++		_room.id = f[1];
++		_mySlot = toInt(f[2], -1);
++		_room.size = toInt(f[3]);
++		fire(onJoinedRoom);
++	}
++	else if (cmd == "ROOM")
++	{
++		parseRoom(f);
++		fire(onRoom, _room);
++	}
++	else if (cmd == "LEFTROOM")
++	{
++		_state = State::Online;
++		_mySlot = _hostSlot = -1;
++		_room = RoomState();
++		fire(onLeftRoom);
++	}
++	else if (cmd == "START")
++	{
++		parseStart(f);
++	}
++	else if (cmd == "IN" && f.size() >= 5)
++	{
++		if (!f[2].empty())
++			fire(onInput, toInt(f[1], -1), f[2][0], toInt(f[3]), toInt(f[4]));
++	}
++	else if (cmd == "SNAP")
++	{
++		fire(onSnapshot, line.size() > 5 ? line.substr(5) : "");
++	}
++	else if (cmd == "EVT")
++	{
++		fire(onEvent, line.size() > 4 ? line.substr(4) : "");
++	}
++	else if (cmd == "LEFT" && f.size() >= 2)
++	{
++		fire(onPlayerLeft, toInt(f[1], -1), f.size() > 2 ? f[2] : "");
++	}
++	else if (cmd == "HOST" && f.size() >= 2)
++	{
++		_hostSlot = toInt(f[1], -1);
++		fire(onHostChanged, _hostSlot);
++	}
++	else if (cmd == "OVER" && f.size() >= 2)
++	{
++		_state = State::InRoom;
++		fire(onOver, toInt(f[1], 0));
++	}
++}
++
++void Client::parseRoom(const std::vector<std::string> &f)
++{
++	if (f.size() < 5)
++		return;
++	_room.id = f[1];
++	_room.size = toInt(f[2]);
++	_room.state = f[3];
++	_room.hostSlot = toInt(f[4], -1);
++	_hostSlot = _room.hostSlot;
++	_room.slots.clear();
++	for (size_t i = 5; i < f.size(); i++)
++	{
++		auto p = split(f[i], ':');
++		if (p.size() < 5)
++			continue;
++		SlotInfo s;
++		s.slot = toInt(p[0]);
++		s.team = toInt(p[1]);
++		s.hero = p[2];
++		s.ready = p[3] == "1";
++		s.nick = p[4];
++		s.human = (s.nick != "-" && s.nick != "COM");
++		_room.slots.push_back(s);
++	}
++}
++
++void Client::parseStart(const std::vector<std::string> &f)
++{
++	if (f.size() < 5)
++		return;
++	StartInfo info;
++	info.seed = (uint32_t)strtoul(f[1].c_str(), nullptr, 10);
++	info.size = toInt(f[2]);
++	info.hostSlot = toInt(f[3], 0);
++	for (size_t i = 4; i < f.size(); i++)
++	{
++		auto p = split(f[i], ':');
++		if (p.size() < 5)
++			continue;
++		SlotInfo s;
++		s.slot = toInt(p[0]);
++		s.team = toInt(p[1]);
++		s.hero = p[2];
++		s.human = p[3] == "1";
++		s.nick = p[4];
++		info.slots.push_back(s);
++	}
++	_hostSlot = info.hostSlot;
++	_state = State::InBattle;
++	fire(onStart, info);
++}
++
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineClient.h b/projects/NarutoSenki/Classes/Online/OnlineClient.h
+--- a/projects/NarutoSenki/Classes/Online/OnlineClient.h	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineClient.h	2026-10-15 03:41:21.345528146 +0000
+@@ -0,0 +1,149 @@
++#pragma once
++// Cliente do modo online (apenas C++ padrão + sockets; sem dependência do cocos2d-x).
++// Toda a rede roda numa thread própria; as mensagens são entregues na thread principal
++// quando alguém chama Client::pump() (feito a cada frame pelo OnlinePump).
++#include <atomic>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace online
++{
++
++constexpr int kProtocolVersion = 1;
++constexpr int kDefaultPort = 7777;
++
++struct SlotInfo
++{
++	int slot = 0;
++	int team = 0; // 0 = Konoha, 1 = Akatsuki
++	std::string hero; // "-" = ainda sem escolha
++	bool ready = false;
++	bool human = false;
++	std::string nick;
++};
++
++struct RoomState
++{
++	std::string id;
++	int size = 0; // jogadores por time (1, 3 ou 4)
++	std::string state; // "lobby" | "battle"
++	int hostSlot = -1;
++	std::vector<SlotInfo> slots;
++};
++
++struct RoomBrief
++{
++	std::string id;
++	int size = 0;
++	int humans = 0;
++	std::string host;
++};
++
++struct StartInfo
++{
++	uint32_t seed = 0;
++	int size = 0;
++	int hostSlot = 0;
++	std::vector<SlotInfo> slots; // elenco completo (humanos e IA), na ordem dos slots
++};
++
++class Client
++{
++public:
++	enum class State
++	{
++		Offline,
++		Connecting,
++		Online, // conectado e identificado, fora de sala
++		InRoom,
++		InBattle
++	};
++
++	Client();
++	~Client();
++	Client(const Client &) = delete;
++	Client &operator=(const Client &) = delete;
++
++	static Client &get(); // instância usada pelo jogo
++
++	// ---- conexão ----
++	void connect(const std::string &host, int port, const std::string &nick);
++	void disconnect();
++	State state() const { return _state; }
++	bool isConnected() const { return _state != State::Offline && _state != State::Connecting; }
++	/** Processa mensagens recebidas e dispara os callbacks. Chamar na thread principal. */
++	void pump();
++
++	// ---- lobby ----
++	void listRooms();
++	void createRoom(int size);
++	void joinRoom(const std::string &id);
++	void leaveRoom();
++	void setTeam(int team);
++	void setHero(const std::string &hero); // "RANDOM" para sorteio
++	void setReady(bool ready);
++	void startMatch(); // só o host
++
++	// ---- partida ----
++	/** kind: M=mover(x*100,y*100) R=soltar joystick A=ataque(ABType) B=soltar ataque G=usar gear S=comprar gear */
++	void sendInput(char kind, int a = 0, int b = 0);
++	void sendSnapshot(const std::string &payload); // só o host
++	void sendEvent(const std::string &payload);	   // só o host
++	void sendOver(int winnerTeam);				   // só o host
++	void quitBattle();
++
++	// ---- informação ----
++	int mySlot() const { return _mySlot; }
++	int hostSlot() const { return _hostSlot; }
++	bool isHost() const { return _mySlot >= 0 && _mySlot == _hostSlot; }
++	int pingMs() const { return _pingMs; }
++	const RoomState &room() const { return _room; }
++	const std::string &nick() const { return _nick; }
++
++	// ---- callbacks (sempre chamados dentro de pump()) ----
++	std::function<void()> onConnected;
++	std::function<void(const std::string &reason)> onDisconnected;
++	std::function<void(const std::string &code)> onError;
++	std::function<void(const std::vector<RoomBrief> &)> onRooms;
++	std::function<void()> onJoinedRoom;
++	std::function<void(const RoomState &)> onRoom;
++	std::function<void()> onLeftRoom;
++	std::function<void(const StartInfo &)> onStart;
++	std::function<void(int slot, char kind, int a, int b)> onInput;
++	std::function<void(const std::string &payload)> onSnapshot;
++	std::function<void(const std::string &payload)> onEvent;
++	std::function<void(int slot, const std::string &reason)> onPlayerLeft;
++	std::function<void(int newHostSlot)> onHostChanged;
++	std::function<void(int winnerTeam)> onOver;
++
++	void clearHandlers();
++
++	// uso interno / testes
++	static std::vector<std::string> split(const std::string &s, char sep = ' ');
++
++	struct Conn; // detalhe de implementação (thread de rede); público só para a thread poder usá-lo
++
++private:
++	void send(const std::string &line);
++	void dispatch(const std::string &line);
++	void parseRoom(const std::vector<std::string> &f);
++	void parseStart(const std::vector<std::string> &f);
++	void teardown(const std::string &reason, bool notify);
++
++	std::shared_ptr<Conn> _conn;
++	std::atomic<State> _state{State::Offline};
++	std::string _nick;
++	int _mySlot = -1;
++	int _hostSlot = -1;
++	int _pingMs = 0;
++	RoomState _room;
++	long long _lastPingMs = 0;
++};
++
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineFlag.h b/projects/NarutoSenki/Classes/Online/OnlineFlag.h
+--- a/projects/NarutoSenki/Classes/Online/OnlineFlag.h	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineFlag.h	2026-10-15 03:41:21.354970707 +0000
+@@ -0,0 +1,7 @@
++#pragma once
++// Cabeçalho mínimo, incluído por Defines.h: diz se há uma partida online em andamento.
++// (Enquanto houver, setRand() não troca a semente do sorteio, para que todos os celulares sorteiem igual.)
++namespace online
++{
++bool isMatchActive();
++}
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.cpp b/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.cpp
+--- a/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.cpp	2026-10-15 03:41:21.351352179 +0000
+@@ -0,0 +1,686 @@
++#include "Online/OnlineLobbyLayer.h"
++#include "Online/OnlineBattle.h"
++#include "Online/OnlinePump.h"
++#include "StartMenu.h"
++#include <algorithm>
++#include <cctype>
++#include <set>
++
++using online::Client;
++
++namespace
++{
++
++const char *kFont = "Arial";
++const ccColor3B kWhite = ccc3(255, 255, 255);
++const ccColor3B kYellow = ccc3(255, 214, 64);
++const ccColor3B kGray = ccc3(150, 150, 160);
++const ccColor3B kRed = ccc3(255, 120, 120);
++const ccColor3B kGreen = ccc3(130, 235, 130);
++const ccColor3B kBlue = ccc3(120, 200, 255);
++
++std::string errText(const std::string &code)
++{
++	if (code == "NO_ROOM")
++		return "Sala não encontrada. Confira o código.";
++	if (code == "FULL")
++		return "Essa sala está cheia.";
++	if (code == "STARTED")
++		return "A partida dessa sala já começou.";
++	if (code == "HERO_TAKEN")
++		return "Esse herói já foi escolhido por outro jogador.";
++	if (code == "NOT_READY")
++		return "Ainda tem jogador que não está pronto.";
++	if (code == "NOT_HOST")
++		return "Só o dono da sala pode iniciar.";
++	if (code == "TEAM_FULL")
++		return "O outro time está cheio.";
++	if (code == "SERVER_FULL")
++		return "O servidor está lotado. Tente mais tarde.";
++	if (code == "NEED_PLAYERS")
++		return "É preciso mais de um jogador para iniciar.";
++	return "Erro do servidor: " + code;
++}
++
++std::string disconnectText(const std::string &reason)
++{
++	if (reason == "dns")
++		return "Não encontrei o servidor. Confira o endereço.";
++	if (reason == "refused")
++		return "Conexão recusada. Confira IP, porta e firewall.";
++	if (reason == "timeout")
++		return "Tempo esgotado ao conectar.";
++	if (reason == "PROTO")
++		return "Versão do servidor incompatível com este jogo.";
++	if (reason == "server_closed" || reason == "closed")
++		return "Conexão encerrada pelo servidor.";
++	return "Conexão perdida (" + reason + ").";
++}
++
++std::string cleanNick(const std::string &in)
++{
++	std::string out;
++	for (char c : in)
++		if (std::isalnum((unsigned char)c) || c == '_')
++			out += c;
++	if (out.size() > 12)
++		out.resize(12);
++	return out.empty() ? "Ninja" : out;
++}
++
++std::string trim(const std::string &s)
++{
++	size_t a = s.find_first_not_of(" \t");
++	size_t b = s.find_last_not_of(" \t");
++	return a == std::string::npos ? "" : s.substr(a, b - a + 1);
++}
++
++} // namespace
++
++Scene *OnlineLobbyLayer::scene()
++{
++	auto s = Scene::create();
++	s->addChild(OnlineLobbyLayer::create());
++	return s;
++}
++
++bool OnlineLobbyLayer::init()
++{
++	if (!Layer::init())
++		return false;
++	online::ensurePump();
++
++	auto bg = LayerColor::create(ccc4(10, 14, 38, 255));
++	addChild(bg, -10);
++
++	auto ud = UserDefault::sharedUserDefault();
++	_host = ud->getStringForKey("online_host", "");
++	_nick = cleanNick(ud->getStringForKey("online_nick", "Ninja"));
++
++	float W = winSize.width, H = winSize.height;
++	_statusLabel = CCLabelTTF::create("", kFont, H / 24.0f, CCSizeMake(W * 0.94f, H * 0.1f),
++									  kCCTextAlignmentCenter, kCCVerticalTextAlignmentCenter);
++	_statusLabel->setPosition(Vec2(W / 2, H * 0.045f));
++	addChild(_statusLabel, 50);
++
++	showPage(Page::Connect);
++	return true;
++}
++
++void OnlineLobbyLayer::onEnter()
++{
++	Layer::onEnter();
++	bindClient();
++	setKeypadEnabled(true);
++	schedule(schedule_selector(OnlineLobbyLayer::autoRefreshRooms), 4.0f);
++}
++
++void OnlineLobbyLayer::onExit()
++{
++	unschedule(schedule_selector(OnlineLobbyLayer::autoRefreshRooms));
++	setKeypadEnabled(false);
++	// Se a partida está começando, quem cuida dos eventos agora é o online::Battle
++	if (!_launching)
++		Client::get().clearHandlers();
++	Layer::onExit();
++}
++
++void OnlineLobbyLayer::keyBackClicked()
++{
++	if (_kbLayer)
++		closeKeyboard(false);
++	else
++		goBackOneStep();
++}
++
++// ------------------------------------------------------------------------------------------------
++// Interface
++// ------------------------------------------------------------------------------------------------
++CCMenuItem *OnlineLobbyLayer::addButton(const std::string &text, float cx, float cy, float w, float h,
++										SEL_MenuHandler sel, int tag, bool enabled, bool primary)
++{
++	return addButtonTo(_menu, text, cx, cy, w, h, sel, tag, enabled, primary);
++}
++
++CCMenuItem *OnlineLobbyLayer::addButtonTo(CCMenu *menu, const std::string &text, float cx, float cy, float w,
++										  float h, SEL_MenuHandler sel, int tag, bool enabled, bool primary)
++{
++	float H = winSize.height;
++	float chars = (float)std::max<size_t>(text.size(), 6);
++	float fs = std::min(H / 24.0f, w / (chars * 0.62f));
++	auto label = CCLabelTTF::create(text.c_str(), kFont, fs, CCSizeMake(w, h), kCCTextAlignmentCenter,
++									kCCVerticalTextAlignmentCenter);
++	label->setColor(enabled ? kWhite : kGray);
++	auto item = CCMenuItemLabel::create(label, this, sel);
++	item->setPosition(Vec2(cx, cy));
++	item->setTag(tag);
++	ccColor4B color = !enabled ? ccc4(45, 45, 55, 220) : (primary ? ccc4(190, 100, 20, 240) : ccc4(40, 56, 110, 240));
++	auto bg = LayerColor::create(color, w, h);
++	item->addChild(bg, -1);
++	item->setEnabled(enabled);
++	menu->addChild(item);
++	return item;
++}
++
++CCLabelTTF *OnlineLobbyLayer::addText(const std::string &text, float x, float y, float size,
++									  const ccColor3B &color, float anchorX)
++{
++	auto label = CCLabelTTF::create(text.c_str(), kFont, size);
++	label->setColor(color);
++	label->setAnchorPoint(Vec2(anchorX, 0.5f));
++	label->setPosition(Vec2(x, y));
++	_content->addChild(label, 3);
++	return label;
++}
++
++void OnlineLobbyLayer::setStatus(const std::string &text, bool isError)
++{
++	_status = text;
++	_statusIsError = isError;
++	if (_statusLabel)
++	{
++		_statusLabel->setString(text.c_str());
++		_statusLabel->setColor(isError ? kRed : kYellow);
++	}
++}
++
++void OnlineLobbyLayer::showPage(Page page)
++{
++	_page = page;
++	if (_content)
++	{
++		_content->removeFromParentAndCleanup(true);
++		_content = nullptr;
++		_menu = nullptr;
++	}
++	_content = Node::create();
++	addChild(_content, 1);
++	_menu = CCMenu::create();
++	_menu->setPosition(CCPointZero);
++	_content->addChild(_menu, 2);
++
++	switch (page)
++	{
++	case Page::Connect:
++		buildConnect();
++		break;
++	case Page::Menu:
++		buildMenu();
++		break;
++	case Page::Room:
++		buildRoom();
++		break;
++	case Page::Heroes:
++		buildHeroes();
++		break;
++	}
++	if (_kbLayer)
++		_menu->setEnabled(false); // teclado aberto: a página fica travada por baixo
++}
++
++void OnlineLobbyLayer::buildConnect()
++{
++	float W = winSize.width, H = winSize.height, fs = H / 18.0f;
++	addText("JOGO ONLINE", W / 2, H - H * 0.1f, H / 11.0f, kYellow);
++
++	addText("Servidor:", W * 0.06f, H * 0.66f, fs, kWhite, 0);
++	addText(_host.empty() ? "(toque em Editar e digite o IP)" : _host, W * 0.27f, H * 0.66f, fs,
++			_host.empty() ? kGray : kGreen, 0);
++	addButton("Editar", W * 0.9f, H * 0.66f, W * 0.15f, H * 0.095f, menu_selector(OnlineLobbyLayer::onEditServer));
++
++	addText("Apelido:", W * 0.06f, H * 0.50f, fs, kWhite, 0);
++	addText(_nick, W * 0.27f, H * 0.50f, fs, kGreen, 0);
++	addButton("Editar", W * 0.9f, H * 0.50f, W * 0.15f, H * 0.095f, menu_selector(OnlineLobbyLayer::onEditNick));
++
++	addButton(_connecting ? "Conectando..." : "Conectar", W * 0.32f, H * 0.30f, W * 0.30f, H * 0.12f,
++			  menu_selector(OnlineLobbyLayer::onConnect), 0, !_connecting, true);
++	addButton("Voltar", W * 0.68f, H * 0.30f, W * 0.30f, H * 0.12f, menu_selector(OnlineLobbyLayer::onBackToMenu));
++
++	addText("Exemplos:  192.168.0.10   ou   meuservidor.com:7777", W / 2, H * 0.17f, H / 26.0f, kGray);
++}
++
++void OnlineLobbyLayer::buildMenu()
++{
++	float W = winSize.width, H = winSize.height, fs = H / 20.0f;
++	addText("Conectado como " + Client::get().nick(), W / 2, H - H * 0.07f, H / 14.0f, kGreen);
++
++	float bw = W * 0.34f, bh = H * 0.10f;
++	addText("Criar sala", W * 0.22f, H * 0.76f, fs, kYellow);
++	addButton("1 x 1", W * 0.22f, H * 0.665f, bw, bh, menu_selector(OnlineLobbyLayer::onCreateRoom), 1);
++	addButton("3 x 3", W * 0.22f, H * 0.545f, bw, bh, menu_selector(OnlineLobbyLayer::onCreateRoom), 3);
++	addButton("4 x 4", W * 0.22f, H * 0.425f, bw, bh, menu_selector(OnlineLobbyLayer::onCreateRoom), 4);
++	addButton("Entrar com código", W * 0.22f, H * 0.285f, bw, bh, menu_selector(OnlineLobbyLayer::onJoinByCode), 0,
++			  true, true);
++
++	addText("Salas abertas", W * 0.66f, H * 0.76f, fs, kYellow);
++	if (_rooms.empty())
++		addText("(nenhuma sala aberta agora)", W * 0.66f, H * 0.64f, H / 24.0f, kGray);
++	for (size_t i = 0; i < _rooms.size() && i < 5; i++)
++	{
++		auto &r = _rooms[i];
++		int max = r.size * 2;
++		std::string t = r.id + "   " + std::to_string(r.size) + "x" + std::to_string(r.size) + "   " +
++						std::to_string(r.humans) + "/" + std::to_string(max) + "   " + r.host;
++		addButton(t, W * 0.66f, H * (0.665f - 0.105f * i), W * 0.5f, H * 0.09f,
++				  menu_selector(OnlineLobbyLayer::onJoinListed), (int)i);
++	}
++
++	addButton("Atualizar lista", W * 0.66f, H * 0.13f, W * 0.30f, H * 0.09f, menu_selector(OnlineLobbyLayer::onRefresh));
++	addButton("Desconectar", W * 0.22f, H * 0.13f, W * 0.30f, H * 0.09f, menu_selector(OnlineLobbyLayer::onDisconnect));
++}
++
++void OnlineLobbyLayer::buildRoom()
++{
++	auto &cl = Client::get();
++	const auto &room = cl.room();
++	float W = winSize.width, H = winSize.height;
++
++	addText("SALA " + room.id + "   (" + std::to_string(room.size) + " x " + std::to_string(room.size) + ")", W / 2,
++			H - H * 0.07f, H / 13.0f, kYellow);
++	addText("Passe esse código para seus amigos entrarem", W / 2, H - H * 0.14f, H / 28.0f, kGray);
++	addText("KONOHA", W * 0.27f, H - H * 0.22f, H / 17.0f, kBlue);
++	addText("AKATSUKI", W * 0.73f, H - H * 0.22f, H / 17.0f, kRed);
++
++	int row[2] = {0, 0};
++	const online::SlotInfo *me = nullptr;
++	for (auto &s : room.slots)
++	{
++		bool mine = s.slot == cl.mySlot();
++		if (mine)
++			me = &s;
++		int r = row[s.team == 0 ? 0 : 1]++;
++		float x = s.team == 0 ? W * 0.03f : W * 0.51f;
++		float y = H - H * 0.30f - r * H * 0.085f;
++		std::string line;
++		ccColor3B color = kWhite;
++		if (s.human)
++		{
++			line = std::string(mine ? "> " : "") + s.nick + " - " + (s.hero == "-" ? "sorteio" : s.hero) +
++				   (s.ready ? "  [PRONTO]" : "");
++			color = s.ready ? kGreen : (mine ? kYellow : kWhite);
++		}
++		else
++		{
++			line = "(vaga: entra uma IA)";
++			color = kGray;
++		}
++		addText(line, x, y, H / 21.0f, color, 0);
++	}
++
++	float bw = W * 0.28f, bh = H * 0.10f;
++	addButton("Trocar de time", W * 0.19f, H * 0.28f, bw, bh, menu_selector(OnlineLobbyLayer::onSwitchTeam));
++	addButton("Escolher herói", W * 0.50f, H * 0.28f, bw, bh, menu_selector(OnlineLobbyLayer::onPickHero));
++	bool ready = me && me->ready;
++	addButton(ready ? "Cancelar pronto" : "Pronto", W * 0.81f, H * 0.28f, bw, bh,
++			  menu_selector(OnlineLobbyLayer::onReady), 0, true, !ready);
++	if (cl.isHost())
++		addButton("Iniciar partida", W * 0.33f, H * 0.15f, W * 0.34f, bh, menu_selector(OnlineLobbyLayer::onStartMatch), 0,
++				  true, true);
++	else
++		addText("Aguardando o dono da sala iniciar...", W * 0.33f, H * 0.15f, H / 26.0f, kGray);
++	addButton("Sair da sala", W * 0.72f, H * 0.15f, W * 0.28f, bh, menu_selector(OnlineLobbyLayer::onLeaveRoom));
++}
++
++void OnlineLobbyLayer::buildHeroes()
++{
++	auto &cl = Client::get();
++	float W = winSize.width, H = winSize.height;
++	addText("Escolha seu herói", W / 2, H - H * 0.07f, H / 13.0f, kYellow);
++
++	std::set<std::string> taken;
++	for (auto &s : cl.room().slots)
++		if (s.human && s.slot != cl.mySlot() && s.hero != "-")
++			taken.insert(s.hero);
++
++	const int cols = 6;
++	float cw = (W - 24.0f) / cols, ch = H * 0.092f;
++	for (size_t i = 0; i < kHeroNum; i++)
++	{
++		int r = (int)i / cols, c = (int)i % cols;
++		float x = 12.0f + cw * (c + 0.5f);
++		float y = H - H * 0.19f - r * (ch + 4.0f);
++		bool isTaken = taken.count(kHeroList[i]) > 0;
++		addButton(kHeroList[i], x, y, cw - 4.0f, ch, menu_selector(OnlineLobbyLayer::onHeroChosen), (int)i, !isTaken);
++	}
++	addButton("Aleatório", W * 0.30f, H * 0.11f, W * 0.28f, H * 0.095f, menu_selector(OnlineLobbyLayer::onHeroRandom));
++	addButton("Voltar", W * 0.70f, H * 0.11f, W * 0.28f, H * 0.095f, menu_selector(OnlineLobbyLayer::onHeroesBack));
++}
++
++// ------------------------------------------------------------------------------------------------
++// Teclado na tela
++// ------------------------------------------------------------------------------------------------
++void OnlineLobbyLayer::showKeyboard(Field field, const std::string &title, const std::string &initial, size_t maxLen)
++{
++	if (_kbLayer)
++		return;
++	_kbField = field;
++	_kbBuffer = initial;
++	_kbMax = maxLen;
++	_kbUpper = (field == Field::RoomCode);
++	_kbLetters.clear();
++
++	float W = winSize.width, H = winSize.height;
++	_kbLayer = LayerColor::create(ccc4(0, 0, 0, 230));
++	addChild(_kbLayer, 100);
++
++	auto t = CCLabelTTF::create(title.c_str(), kFont, H / 17.0f);
++	t->setColor(kYellow);
++	t->setPosition(Vec2(W / 2, H - H * 0.07f));
++	_kbLayer->addChild(t, 1);
++
++	_kbText = CCLabelTTF::create("_", kFont, H / 11.0f);
++	_kbText->setColor(kGreen);
++	_kbText->setPosition(Vec2(W / 2, H - H * 0.18f));
++	_kbLayer->addChild(_kbText, 1);
++	refreshKeyboardText();
++
++	auto kbMenu = CCMenu::create();
++	kbMenu->setPosition(CCPointZero);
++	_kbLayer->addChild(kbMenu, 2);
++
++	const char *rows[4] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm.:-_"};
++	float kw = std::min(H * 0.105f, (W - 20.0f) / 11.0f), kh = H * 0.10f, gap = 3.0f;
++	for (int r = 0; r < 4; r++)
++	{
++		std::string row = rows[r];
++		float total = row.size() * (kw + gap) - gap;
++		float x0 = (W - total) / 2 + kw / 2;
++		float y = H - H * 0.31f - r * (kh + gap);
++		for (size_t i = 0; i < row.size(); i++)
++		{
++			std::string s(1, row[i]);
++			auto it = addButtonTo(kbMenu, s, x0 + i * (kw + gap), y, kw, kh, menu_selector(OnlineLobbyLayer::onKey),
++								  (int)row[i]);
++			if (std::isalpha((unsigned char)row[i]))
++				_kbLetters.push_back((CCMenuItemLabel *)it);
++		}
++	}
++	float y = H - H * 0.31f - 4 * (kh + gap);
++	float bw = W * 0.2f;
++	addButtonTo(kbMenu, "Aa", W * 0.14f, y, bw, kh, menu_selector(OnlineLobbyLayer::onKeyShift));
++	addButtonTo(kbMenu, "Apagar", W * 0.37f, y, bw, kh, menu_selector(OnlineLobbyLayer::onKeyErase));
++	addButtonTo(kbMenu, "Cancelar", W * 0.60f, y, bw, kh, menu_selector(OnlineLobbyLayer::onKeyCancel));
++	addButtonTo(kbMenu, "OK", W * 0.84f, y, bw, kh, menu_selector(OnlineLobbyLayer::onKeyOk), 0, true, true);
++
++	if (_menu)
++		_menu->setEnabled(false);
++}
++
++void OnlineLobbyLayer::refreshKeyboardText()
++{
++	if (_kbText)
++		_kbText->setString((_kbBuffer + "_").c_str());
++}
++
++void OnlineLobbyLayer::closeKeyboard(bool apply)
++{
++	if (!_kbLayer)
++		return;
++	_kbLayer->removeFromParentAndCleanup(true);
++	_kbLayer = nullptr;
++	_kbText = nullptr;
++	_kbLetters.clear();
++
++	if (apply)
++	{
++		auto ud = UserDefault::sharedUserDefault();
++		switch (_kbField)
++		{
++		case Field::Server:
++			_host = trim(_kbBuffer);
++			ud->setStringForKey("online_host", _host);
++			ud->flush();
++			break;
++		case Field::Nick:
++			_nick = cleanNick(_kbBuffer);
++			ud->setStringForKey("online_nick", _nick);
++			ud->flush();
++			break;
++		case Field::RoomCode:
++		{
++			std::string code;
++			for (char c : _kbBuffer)
++				code += (char)std::toupper((unsigned char)c);
++			if (code.size() == 4)
++			{
++				setStatus("Entrando na sala " + code + "...");
++				Client::get().joinRoom(code);
++			}
++			else
++			{
++				setStatus("O código da sala tem 4 letras/números.", true);
++			}
++			break;
++		}
++		}
++	}
++	showPage(_page); // reconstrói a página (reabilita os botões)
++}
++
++void OnlineLobbyLayer::onKey(Ref *sender)
++{
++	char c = (char)((CCNode *)sender)->getTag();
++	if (_kbField == Field::RoomCode || _kbUpper)
++		c = (char)std::toupper((unsigned char)c);
++	if (_kbBuffer.size() < _kbMax)
++		_kbBuffer += c;
++	refreshKeyboardText();
++}
++
++void OnlineLobbyLayer::onKeyErase(Ref *)
++{
++	if (!_kbBuffer.empty())
++		_kbBuffer.pop_back();
++	refreshKeyboardText();
++}
++
++void OnlineLobbyLayer::onKeyShift(Ref *)
++{
++	_kbUpper = !_kbUpper;
++	for (auto item : _kbLetters)
++	{
++		char c = (char)item->getTag();
++		std::string s(1, _kbUpper ? (char)std::toupper((unsigned char)c) : c);
++		item->setString(s.c_str());
++	}
++}
++
++void OnlineLobbyLayer::onKeyOk(Ref *) { closeKeyboard(true); }
++void OnlineLobbyLayer::onKeyCancel(Ref *) { closeKeyboard(false); }
++
++// ------------------------------------------------------------------------------------------------
++// Botões
++// ------------------------------------------------------------------------------------------------
++void OnlineLobbyLayer::onEditServer(Ref *)
++{
++	showKeyboard(Field::Server, "Endereço do servidor (IP ou nome:porta)", _host, 40);
++}
++
++void OnlineLobbyLayer::onEditNick(Ref *)
++{
++	showKeyboard(Field::Nick, "Seu apelido (até 12 letras/números)", _nick, 12);
++}
++
++void OnlineLobbyLayer::onConnect(Ref *)
++{
++	std::string host = trim(_host);
++	int port = online::kDefaultPort;
++	size_t colon = host.rfind(':');
++	if (colon != std::string::npos)
++	{
++		port = std::atoi(host.substr(colon + 1).c_str());
++		host = host.substr(0, colon);
++	}
++	if (host.empty() || port <= 0 || port > 65535)
++	{
++		setStatus("Digite o endereço do servidor (ex.: 192.168.0.10).", true);
++		return;
++	}
++	_connecting = true;
++	setStatus("Conectando a " + host + ":" + std::to_string(port) + " ...");
++	showPage(Page::Connect);
++	Client::get().connect(host, port, _nick);
++}
++
++void OnlineLobbyLayer::onBackToMenu(Ref *) { leaveToStartMenu(); }
++
++void OnlineLobbyLayer::onCreateRoom(Ref *sender)
++{
++	setStatus("");
++	Client::get().createRoom(((CCNode *)sender)->getTag());
++}
++
++void OnlineLobbyLayer::onJoinByCode(Ref *) { showKeyboard(Field::RoomCode, "Código da sala", "", 4); }
++
++void OnlineLobbyLayer::onJoinListed(Ref *sender)
++{
++	size_t idx = (size_t)((CCNode *)sender)->getTag();
++	if (idx < _rooms.size())
++	{
++		setStatus("");
++		Client::get().joinRoom(_rooms[idx].id);
++	}
++}
++
++void OnlineLobbyLayer::onRefresh(Ref *) { Client::get().listRooms(); }
++
++void OnlineLobbyLayer::onDisconnect(Ref *)
++{
++	Client::get().disconnect();
++	_rooms.clear();
++	_connecting = false;
++	setStatus("");
++	showPage(Page::Connect);
++}
++
++void OnlineLobbyLayer::onSwitchTeam(Ref *)
++{
++	auto &cl = Client::get();
++	for (auto &s : cl.room().slots)
++		if (s.slot == cl.mySlot())
++			cl.setTeam(1 - s.team);
++}
++
++void OnlineLobbyLayer::onPickHero(Ref *) { showPage(Page::Heroes); }
++
++void OnlineLobbyLayer::onHeroChosen(Ref *sender)
++{
++	size_t idx = (size_t)((CCNode *)sender)->getTag();
++	if (idx < kHeroNum)
++		Client::get().setHero(kHeroList[idx]);
++	showPage(Page::Room);
++}
++
++void OnlineLobbyLayer::onHeroRandom(Ref *)
++{
++	Client::get().setHero("RANDOM");
++	showPage(Page::Room);
++}
++
++void OnlineLobbyLayer::onHeroesBack(Ref *) { showPage(Page::Room); }
++
++void OnlineLobbyLayer::onReady(Ref *)
++{
++	auto &cl = Client::get();
++	for (auto &s : cl.room().slots)
++		if (s.slot == cl.mySlot())
++			cl.setReady(!s.ready);
++}
++
++void OnlineLobbyLayer::onStartMatch(Ref *)
++{
++	setStatus("");
++	Client::get().startMatch();
++}
++
++void OnlineLobbyLayer::onLeaveRoom(Ref *) { Client::get().leaveRoom(); }
++
++void OnlineLobbyLayer::autoRefreshRooms(float)
++{
++	if (_page == Page::Menu && Client::get().state() == Client::State::Online)
++		Client::get().listRooms();
++}
++
++// ------------------------------------------------------------------------------------------------
++// Eventos do servidor
++// ------------------------------------------------------------------------------------------------
++void OnlineLobbyLayer::bindClient()
++{
++	auto &c = Client::get();
++	c.clearHandlers();
++	c.onConnected = [this]()
++	{
++		_connecting = false;
++		setStatus("");
++		showPage(Page::Menu);
++		Client::get().listRooms();
++	};
++	c.onDisconnected = [this](const std::string &reason)
++	{
++		_connecting = false;
++		_rooms.clear();
++		if (_kbLayer)
++			closeKeyboard(false);
++		showPage(Page::Connect);
++		setStatus(disconnectText(reason), true);
++	};
++	c.onError = [this](const std::string &code) { setStatus(errText(code), true); };
++	c.onRooms = [this](const std::vector<online::RoomBrief> &rooms)
++	{
++		_rooms = rooms;
++		if (_page == Page::Menu && !_kbLayer)
++			showPage(Page::Menu);
++	};
++	c.onJoinedRoom = [this]() { setStatus(""); };
++	c.onRoom = [this](const online::RoomState &)
++	{
++		if (_kbLayer)
++			closeKeyboard(false);
++		if (_page != Page::Heroes) // na escolha de herói não reconstruímos a tela debaixo do dedo
++			showPage(Page::Room);
++	};
++	c.onLeftRoom = [this]()
++	{
++		showPage(Page::Menu);
++		Client::get().listRooms();
++	};
++	c.onStart = [this](const online::StartInfo &info)
++	{
++		if (_launching)
++			return;
++		_launching = true;
++		if (_kbLayer)
++			closeKeyboard(false);
++		setStatus("Iniciando a partida...");
++		online::Battle::get().launch(info);
++	};
++}
++
++void OnlineLobbyLayer::goBackOneStep()
++{
++	switch (_page)
++	{
++	case Page::Heroes:
++		showPage(Page::Room);
++		break;
++	case Page::Room:
++		Client::get().leaveRoom();
++		break;
++	case Page::Menu:
++		onDisconnect(nullptr);
++		break;
++	case Page::Connect:
++		leaveToStartMenu();
++		break;
++	}
++}
++
++void OnlineLobbyLayer::leaveToStartMenu()
++{
++	SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/cancel.ogg");
++	Client::get().disconnect();
++	Client::get().clearHandlers();
++	auto menuScene = Scene::create();
++	menuScene->addChild(StartMenu::create());
++	Director::sharedDirector()->replaceScene(TransitionFade::create(1.0f, menuScene));
++}
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.h b/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.h
+--- a/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.h	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlineLobbyLayer.h	2026-10-15 03:41:21.350047515 +0000
+@@ -0,0 +1,105 @@
++#pragma once
++// Tela do modo online: conectar ao servidor, criar/entrar em sala, escolher time e herói, iniciar.
++// Feita só com camadas coloridas e texto (não depende de imagens novas) e com um teclado próprio na tela,
++// porque o celular precisa digitar IP/apelido/código sem depender de caixa de texto nativa.
++#include "Defines.h"
++#include "Online/OnlineClient.h"
++#include <string>
++#include <vector>
++
++class OnlineLobbyLayer : public Layer
++{
++public:
++	static Scene *scene();
++	CREATE_FUNC(OnlineLobbyLayer);
++
++	bool init() override;
++	void onEnter() override;
++	void onExit() override;
++	void keyBackClicked() override;
++
++private:
++	enum class Page
++	{
++		Connect,
++		Menu,
++		Room,
++		Heroes
++	};
++	enum class Field
++	{
++		Server,
++		Nick,
++		RoomCode
++	};
++
++	// ---- construção da interface ----
++	CCMenuItem *addButton(const std::string &text, float cx, float cy, float w, float h, SEL_MenuHandler sel,
++						  int tag = 0, bool enabled = true, bool primary = false);
++	CCMenuItem *addButtonTo(CCMenu *menu, const std::string &text, float cx, float cy, float w, float h,
++							SEL_MenuHandler sel, int tag = 0, bool enabled = true, bool primary = false);
++	CCLabelTTF *addText(const std::string &text, float x, float y, float size, const ccColor3B &color,
++						float anchorX = 0.5f);
++	void showPage(Page page);
++	void buildConnect();
++	void buildMenu();
++	void buildRoom();
++	void buildHeroes();
++	void setStatus(const std::string &text, bool isError = false);
++
++	// ---- teclado na tela ----
++	void showKeyboard(Field field, const std::string &title, const std::string &initial, size_t maxLen);
++	void closeKeyboard(bool apply);
++	void refreshKeyboardText();
++
++	// ---- botões ----
++	void onEditServer(Ref *);
++	void onEditNick(Ref *);
++	void onConnect(Ref *);
++	void onBackToMenu(Ref *);
++	void onCreateRoom(Ref *);
++	void onJoinByCode(Ref *);
++	void onJoinListed(Ref *);
++	void onRefresh(Ref *);
++	void onDisconnect(Ref *);
++	void onSwitchTeam(Ref *);
++	void onPickHero(Ref *);
++	void onHeroChosen(Ref *);
++	void onHeroRandom(Ref *);
++	void onHeroesBack(Ref *);
++	void onReady(Ref *);
++	void onStartMatch(Ref *);
++	void onLeaveRoom(Ref *);
++	void onKey(Ref *);
++	void onKeyErase(Ref *);
++	void onKeyShift(Ref *);
++	void onKeyOk(Ref *);
++	void onKeyCancel(Ref *);
++	void autoRefreshRooms(float dt);
++
++	void bindClient();
++	void goBackOneStep();
++	void leaveToStartMenu();
++
++	Page _page = Page::Connect;
++	Node *_content = nullptr; // tudo da página atual (recriado a cada showPage)
++	CCMenu *_menu = nullptr;
++	CCLabelTTF *_statusLabel = nullptr;
++	std::string _status;
++	bool _statusIsError = false;
++
++	std::string _host;
++	std::string _nick;
++	bool _connecting = false;
++	bool _launching = false;
++	std::vector<online::RoomBrief> _rooms;
++
++	// teclado
++	Node *_kbLayer = nullptr;
++	CCLabelTTF *_kbText = nullptr;
++	Field _kbField = Field::Server;
++	std::string _kbBuffer;
++	size_t _kbMax = 24;
++	bool _kbUpper = false;
++	std::vector<CCMenuItemLabel *> _kbLetters;
++};
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlinePump.cpp b/projects/NarutoSenki/Classes/Online/OnlinePump.cpp
+--- a/projects/NarutoSenki/Classes/Online/OnlinePump.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlinePump.cpp	2026-10-15 03:41:21.353703955 +0000
+@@ -0,0 +1,27 @@
++#include "Online/OnlinePump.h"
++#include "Defines.h"
++#include "Online/OnlineClient.h"
++
++namespace online
++{
++
++namespace
++{
++class PumpTarget : public CCObject
++{
++public:
++	void update(float) override { Client::get().pump(); }
++};
++
++PumpTarget *s_pump = nullptr;
++} // namespace
++
++void ensurePump()
++{
++	if (s_pump)
++		return;
++	s_pump = new PumpTarget(); // vive até o fim do processo (o agendador só guarda o ponteiro)
++	Director::sharedDirector()->getScheduler()->scheduleUpdateForTarget(s_pump, 0, false);
++}
++
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/Online/OnlinePump.h b/projects/NarutoSenki/Classes/Online/OnlinePump.h
+--- a/projects/NarutoSenki/Classes/Online/OnlinePump.h	1970-01-01 00:00:00.000000000 +0000
++++ b/projects/NarutoSenki/Classes/Online/OnlinePump.h	2026-10-15 03:41:21.352565432 +0000
+@@ -0,0 +1,7 @@
++#pragma once
++// Liga o online ao laço principal do jogo: a cada frame entrega as mensagens recebidas.
++namespace online
++{
++/** Idempotente. Pode ser chamado de qualquer tela antes de usar o Client. */
++void ensurePump();
++} // namespace online
+diff -ruN a/projects/NarutoSenki/Classes/UI/GameModeLayer.cpp b/projects/NarutoSenki/Classes/UI/GameModeLayer.cpp
+--- a/projects/NarutoSenki/Classes/UI/GameModeLayer.cpp	2026-10-15 03:41:21.331017619 +0000
++++ b/projects/NarutoSenki/Classes/UI/GameModeLayer.cpp	2026-10-15 03:41:21.332202392 +0000
+@@ -1,6 +1,7 @@
+ #include "StartMenu.h"
+ #include "UI/GameModeLayer.h"
+ #include "UI/ModeMenuButton.hpp"
++#include "Online/OnlineLobbyLayer.h"
+ #include "Constants/UiFlowKeys.hpp"
+ 
+ extern const GameData kDefaultGameData;
+@@ -100,6 +101,20 @@
+ 	return_btn->setPosition(winSize.width - 38, 65);
+ 	addChild(return_btn, 5);
+ 
++	// Online: botão de texto (não precisa de imagem nova). Fica à esquerda do botão de voltar.
++	{
++		const float bw = 96, bh = 30;
++		auto label = CCLabelTTF::create("ONLINE", "Arial", 16, CCSizeMake(bw, bh), kCCTextAlignmentCenter, kCCVerticalTextAlignmentCenter);
++		label->setColor(ccc3(255, 255, 255));
++		auto onlineItem = CCMenuItemLabel::create(label, this, menu_selector(GameModeLayer::openOnline));
++		auto onlineBg = LayerColor::create(ccc4(190, 100, 20, 235), bw, bh);
++		onlineItem->addChild(onlineBg, -1);
++		onlineItem->setPosition(Vec2(winSize.width - 38 - 85, 65));
++		Menu *onlineMenu = Menu::create(onlineItem, nullptr);
++		onlineMenu->setPosition(Vec2(0, 0));
++		addChild(onlineMenu, 5);
++	}
++
+ 	return Layer::init();
+ }
+ 
+@@ -113,6 +128,12 @@
+ 	Director::sharedDirector()->replaceScene(TransitionFade::create(1.0f, menuScene));
+ }
+ 
++void GameModeLayer::openOnline(Ref *sender)
++{
++	SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/select.ogg");
++	Director::sharedDirector()->replaceScene(TransitionFade::create(0.6f, OnlineLobbyLayer::scene()));
++}
++
+ void GameModeLayer::initModeData()
+ {
+ 	// init mode text data
+diff -ruN a/projects/NarutoSenki/Classes/UI/GameModeLayer.h b/projects/NarutoSenki/Classes/UI/GameModeLayer.h
+--- a/projects/NarutoSenki/Classes/UI/GameModeLayer.h	2026-10-15 03:41:21.336484606 +0000
++++ b/projects/NarutoSenki/Classes/UI/GameModeLayer.h	2026-10-15 03:41:21.337670330 +0000
+@@ -10,6 +10,7 @@
+ 
+ 	bool init();
+ 	void backToMenu(Ref *sender);
++	void openOnline(Ref *sender); // Online: abre o lobby
+ 
+ 	void initModeData();
+ 	bool pushMode(const GameModeData &data);
+diff -ruN a/projects/NarutoSenki/proj.android-studio/app/jni/Android.mk b/projects/NarutoSenki/proj.android-studio/app/jni/Android.mk
+--- a/projects/NarutoSenki/proj.android-studio/app/jni/Android.mk	2026-10-15 03:41:21.341866459 +0000
++++ b/projects/NarutoSenki/proj.android-studio/app/jni/Android.mk	2026-10-15 03:41:21.343287053 +0000
+@@ -33,6 +33,10 @@
+ 		../../../Classes/MyUtils/KTools.cpp \
+ 		../../../Classes/MyUtils/MD5ChecksumDefines.cpp \
+ 		../../../Classes/UI/GameModeLayer.cpp \
++		../../../Classes/Online/OnlineClient.cpp \
++		../../../Classes/Online/OnlineBattle.cpp \
++		../../../Classes/Online/OnlineLobbyLayer.cpp \
++		../../../Classes/Online/OnlinePump.cpp \
+         ../../../../../external/sqlite3/src/sqlite3.c \
+ 
+ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../../Classes \
