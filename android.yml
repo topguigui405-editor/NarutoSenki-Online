@@ -1,0 +1,49 @@
+# Compila o APK do Naruto Senki V2 (com o modo online) nos servidores do GitHub.
+# Como usar: aba "Actions" do seu repositório -> "Build Android APK" -> "Run workflow".
+# Roda 3 versões do NDK em paralelo: se uma falhar, outra pode funcionar. Baixe o APK da que ficar verde.
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: APK (NDK ${{ matrix.ndk }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        ndk: ["21.4.7075529", "23.2.8568313", "25.2.9519653"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aplicar o modo online
+        run: |
+          if [ -f online-mode-files.zip ]; then unzip -o online-mode-files.zip; fi
+          test -f projects/NarutoSenki/Classes/Online/OnlineBattle.cpp || { echo "ERRO: suba o arquivo online-mode-files.zip na raiz do repositorio"; exit 1; }
+
+      - name: Instalar SDK e NDK do Android
+        run: |
+          SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-31" "build-tools;31.0.0" "ndk;${{ matrix.ndk }}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Compilar
+        working-directory: projects/NarutoSenki/proj.android-studio
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          echo "ndk.dir=$ANDROID_SDK_ROOT/ndk/${{ matrix.ndk }}" >> local.properties
+          chmod +x gradlew
+          ./gradlew :narutosenki:assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NarutoSenki-Online-NDK-${{ matrix.ndk }}
+          path: projects/NarutoSenki/proj.android-studio/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
