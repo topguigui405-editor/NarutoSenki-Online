@@ -1,6 +1,6 @@
 # Compila o APK do Naruto Senki V2 (com o modo online) nos servidores do GitHub.
-# Como usar: aba "Actions" do seu repositório -> "Build Android APK" -> "Run workflow".
-# Roda 3 versões do NDK em paralelo: se uma falhar, outra pode funcionar. Baixe o APK da que ficar verde.
+# Como usar: aba "Actions" -> "Build Android APK" -> "Run workflow".
+# Se der erro, o passo "Resumo dos erros" mostra só as linhas importantes.
 name: Build Android APK
 
 on:
@@ -14,14 +14,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ndk: ["21.4.7075529", "23.2.8568313", "25.2.9519653"]
+        ndk: ["21.4.7075529", "22.1.7171670"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Aplicar o modo online
         run: |
-          if [ -f online-mode-files.zip ]; then unzip -o online-mode-files.zip; fi
-          test -f projects/NarutoSenki/Classes/Online/OnlineBattle.cpp || { echo "ERRO: suba o arquivo online-mode-files.zip na raiz do repositorio"; exit 1; }
+          test -f online-mode-android.patch || { echo "ERRO: suba o arquivo online-mode-android.patch na raiz do repositorio"; exit 1; }
+          if [ -f projects/NarutoSenki/Classes/Online/OnlineBattle.cpp ]; then
+            echo "Modo online ja esta no codigo, nada a aplicar."
+          else
+            patch -p1 --forward --no-backup-if-mismatch < online-mode-android.patch
+          fi
 
       - name: Instalar SDK e NDK do Android
         run: |
@@ -37,10 +41,19 @@ jobs:
       - name: Compilar
         working-directory: projects/NarutoSenki/proj.android-studio
         run: |
+          set -o pipefail
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
           echo "ndk.dir=$ANDROID_SDK_ROOT/ndk/${{ matrix.ndk }}" >> local.properties
           chmod +x gradlew
-          ./gradlew :narutosenki:assembleDebug --no-daemon --stacktrace
+          ./gradlew :narutosenki:assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Resumo dos erros
+        if: failure()
+        run: |
+          echo "=== Erros de compilacao (arquivo:linha) ==="
+          grep -E " error:| error: |undefined reference|Error [0-9]+$" "$RUNNER_TEMP/build.log" | grep -v "warning" | sort -u | head -40 || true
+          echo "=== Resumo do Gradle ==="
+          grep -A6 "What went wrong" "$RUNNER_TEMP/build.log" | head -20 || true
 
       - uses: actions/upload-artifact@v4
         with:
